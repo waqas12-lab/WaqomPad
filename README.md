@@ -14,14 +14,6 @@ Lightweight • Native UI • Cross-Platform
 
 ---
 
-## 🎨 App Icon
-
-<p align="center">
-  <img src="assets/waqompad_icon.png" alt="WaqomPad Icon" width="120"/>
-</p>
-
----
-
 ## 📸 Screenshot
 
 <p align="center">
