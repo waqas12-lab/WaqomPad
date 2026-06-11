@@ -122,11 +122,11 @@ WaqomPad/
 
 ---
 
-## 📜 License
+# 📝 WaqomPad
 
-MIT License.
+![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)
 
----
+Professional Java Swing Text Editor
 
 <p align="center">
 Made with ❤️ using Java Swing
