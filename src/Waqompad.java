@@ -18,12 +18,14 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.prefs.Preferences;
+import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
 public class Waqompad extends JFrame {
 
     // ---------- Global (app-wide) state ----------
     private static final Preferences PREFS = Preferences.userNodeForPackage(Waqompad.class);
+    private static final int MASK = Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx();
     private static final int MAX_RECENT = 5;
     private static final AtomicBoolean RECOVERY_CHECKED = new AtomicBoolean(false);
     private static final File AUTOSAVE_DIR = new File(System.getProperty("user.home"), ".waqompad_autosave");
@@ -44,7 +46,9 @@ public class Waqompad extends JFrame {
     private JPanel statusPanel;
     private final JLabel statusBar = new JLabel("Ln 1, Col 1");
     private final JLabel wordCountLabel = new JLabel("Words: 0  Chars: 0");
+    private final JLabel zoomLabel = new JLabel("100%");
     private javax.swing.Timer autoSaveTimer;
+    private final javax.swing.Timer wordCountDebounce = new javax.swing.Timer(200, e -> updateWordCount());
 
     // Theme colors
     private static final Color LIGHT_BG = Color.WHITE;
@@ -123,9 +127,14 @@ public class Waqompad extends JFrame {
 
         statusBar.setBorder(BorderFactory.createEmptyBorder(4, 8, 4, 8));
         wordCountLabel.setBorder(BorderFactory.createEmptyBorder(4, 8, 4, 8));
+        zoomLabel.setBorder(BorderFactory.createEmptyBorder(4, 8, 4, 8));
+        JPanel rightStatus = new JPanel(new FlowLayout(FlowLayout.RIGHT, 0, 0));
+        rightStatus.setOpaque(false);
+        rightStatus.add(wordCountLabel);
+        rightStatus.add(zoomLabel);
         statusPanel = new JPanel(new BorderLayout());
         statusPanel.add(statusBar, BorderLayout.WEST);
-        statusPanel.add(wordCountLabel, BorderLayout.EAST);
+        statusPanel.add(rightStatus, BorderLayout.EAST);
         statusPanel.setOpaque(true);
         add(statusPanel, BorderLayout.SOUTH);
 
@@ -136,6 +145,7 @@ public class Waqompad extends JFrame {
         addWindowListener(new WindowAdapter() { public void windowClosing(WindowEvent e) { exitApp(); } });
 
         AUTOSAVE_DIR.mkdirs();
+        wordCountDebounce.setRepeats(false);
         addTab("Untitled");
         setupAutoSave();
         if (RECOVERY_CHECKED.compareAndSet(false, true)) checkForRecovery();
@@ -143,6 +153,7 @@ public class Waqompad extends JFrame {
         updateTitle();
         updateStatusBar();
         updateWordCount();
+        updateZoomLabel();
         applyTheme();
         rebuildRecentMenu();
     }
@@ -161,16 +172,23 @@ public class Waqompad extends JFrame {
         boolean wrap = wordWrapItem != null && wordWrapItem.isSelected();
         tab.textArea.setLineWrap(wrap);
         tab.textArea.setWrapStyleWord(wrap);
-        boolean showLines = lineNumbersItem != null && lineNumbersItem.isSelected();
-        tab.scrollPane.setRowHeaderView(showLines && !wrap ? tab.lineNumberArea : null);
 
         tabbedPane.addTab(title, tab);
         setupTabComponent(tab, title);
         wireTabListeners(tab);
         tabbedPane.setSelectedComponent(tab);
         applyThemeToTab(tab);
-        styleTabStrip(tab);
+        if (lineNumbersItem != null) refreshLineNumberVisibility();
         return tab;
+    }
+
+    /** Shows/hides the line-number gutter on every open tab based on the Line Numbers and Word Wrap toggles. */
+    private void refreshLineNumberVisibility() {
+        boolean show = lineNumbersItem.isSelected() && !wordWrapItem.isSelected();
+        for (EditorTab t : allTabs()) {
+            if (show) t.lineNumberArea.updateWidth();
+            t.scrollPane.setRowHeaderView(show ? t.lineNumberArea : null);
+        }
     }
 
     private void setupTabComponent(EditorTab tab, String title) {
@@ -203,9 +221,16 @@ public class Waqompad extends JFrame {
             public void changedUpdate(DocumentEvent e) { markModified(tab); }
         });
         tab.textArea.addCaretListener(e -> { if (currentTab() == tab) updateStatusBar(); });
+        // Plain mouse-wheel/trackpad scrolling always passes through untouched (JScrollPane
+        // handles it natively). Holding the platform shortcut key (Cmd on macOS, Ctrl on
+        // Windows/Linux) while scrolling or swiping on a trackpad zooms instead.
         tab.textArea.addMouseWheelListener(e -> {
-            if ((e.getModifiersEx() & InputEvent.CTRL_DOWN_MASK) != 0) {
-                setEditorFontSize(fontSize - e.getWheelRotation() * 2);
+            if ((e.getModifiersEx() & MASK) != 0) {
+                int rotation = e.getWheelRotation();
+                if (rotation == 0 && e.getPreciseWheelRotation() != 0) {
+                    rotation = e.getPreciseWheelRotation() > 0 ? 1 : -1;
+                }
+                setEditorFontSize(fontSize - rotation * 2);
                 e.consume();
             }
         });
@@ -233,6 +258,20 @@ public class Waqompad extends JFrame {
 
     // ---------- Menu ----------
 
+    /** Plain menu item, no accelerator. */
+    private JMenuItem mi(String title, ActionListener action) {
+        JMenuItem item = new JMenuItem(title);
+        item.addActionListener(action);
+        return item;
+    }
+
+    /** Menu item with an explicit KeyStroke accelerator (for shortcuts outside the standard platform mask). */
+    private JMenuItem mi(String title, KeyStroke accelerator, ActionListener action) {
+        JMenuItem item = mi(title, action);
+        item.setAccelerator(accelerator);
+        return item;
+    }
+
     private JMenuBar createMenuBar() {
         JMenuBar menuBar = new JMenuBar();
         JMenu file = new JMenu("File");
@@ -245,10 +284,10 @@ public class Waqompad extends JFrame {
         file.add(createItem("Save As", KeyEvent.VK_S, InputEvent.SHIFT_DOWN_MASK, e -> { EditorTab t = currentTab(); if (t != null) saveTabAs(t); }));
         file.add(createItem("Close Tab", KeyEvent.VK_W, 0, e -> { EditorTab t = currentTab(); if (t != null) closeTab(t); }));
         file.addSeparator();
-        file.add(new JMenuItem(new AbstractAction("Page Setup") { public void actionPerformed(ActionEvent e) { JOptionPane.showMessageDialog(Waqompad.this, "Page setup is handled by the native print dialog."); }}));
+        file.add(mi("Page Setup", e -> JOptionPane.showMessageDialog(this, "Page setup is handled by the native print dialog.")));
         file.add(createItem("Print", KeyEvent.VK_P, 0, e -> printFile()));
         file.addSeparator();
-        file.add(new JMenuItem(new AbstractAction("Exit") { public void actionPerformed(ActionEvent e) { exitApp(); }}));
+        file.add(mi("Exit", e -> exitApp()));
 
         JMenu edit = new JMenu("Edit");
         edit.add(createItem("Undo", KeyEvent.VK_Z, 0, e -> { EditorTab t = currentTab(); if (t != null && t.undoManager.canUndo()) t.undoManager.undo(); }));
@@ -257,36 +296,28 @@ public class Waqompad extends JFrame {
         edit.add(createItem("Cut", KeyEvent.VK_X, 0, e -> { EditorTab t = currentTab(); if (t != null) t.textArea.cut(); }));
         edit.add(createItem("Copy", KeyEvent.VK_C, 0, e -> { EditorTab t = currentTab(); if (t != null) t.textArea.copy(); }));
         edit.add(createItem("Paste", KeyEvent.VK_V, 0, e -> { EditorTab t = currentTab(); if (t != null) t.textArea.paste(); }));
-        edit.add(new JMenuItem(new AbstractAction("Delete") { public void actionPerformed(ActionEvent e) { EditorTab t = currentTab(); if (t != null) t.textArea.replaceSelection(""); }}));
+        edit.add(mi("Delete", e -> { EditorTab t = currentTab(); if (t != null) t.textArea.replaceSelection(""); }));
         edit.addSeparator();
-        edit.add(new JMenuItem(new AbstractAction("Search with Bing") { public void actionPerformed(ActionEvent e) { searchWithBing(); }}));
+        edit.add(mi("Search with Bing", e -> searchWithBing()));
         edit.add(createItem("Find", KeyEvent.VK_F, 0, e -> showFindDialog()));
-        edit.add(new JMenuItem(new AbstractAction("Find Next") { public void actionPerformed(ActionEvent e) { findText(false); }}));
-        edit.add(new JMenuItem(new AbstractAction("Find Previous") { public void actionPerformed(ActionEvent e) { findText(true); }}));
+        edit.add(mi("Find Next", e -> findText(false)));
+        edit.add(mi("Find Previous", e -> findText(true)));
         edit.add(createItem("Replace", KeyEvent.VK_H, 0, e -> showReplaceDialog()));
         edit.add(createItem("Go To", KeyEvent.VK_G, 0, e -> goToLine()));
         edit.addSeparator();
         edit.add(createItem("Select All", KeyEvent.VK_A, 0, e -> { EditorTab t = currentTab(); if (t != null) t.textArea.selectAll(); }));
-        JMenuItem timeDate = new JMenuItem(new AbstractAction("Time/Date") { public void actionPerformed(ActionEvent e) { insertTimeDate(); }});
-        timeDate.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_F5, 0));
-        edit.add(timeDate);
+        edit.add(mi("Time/Date", KeyStroke.getKeyStroke(KeyEvent.VK_F5, 0), e -> insertTimeDate()));
         edit.addSeparator();
 
         JMenu caseMenu = new JMenu("Convert Case");
-        caseMenu.add(new JMenuItem(new AbstractAction("UPPERCASE") { public void actionPerformed(ActionEvent e) { convertSelectionCase(0); }}));
-        caseMenu.add(new JMenuItem(new AbstractAction("lowercase") { public void actionPerformed(ActionEvent e) { convertSelectionCase(1); }}));
-        caseMenu.add(new JMenuItem(new AbstractAction("Title Case") { public void actionPerformed(ActionEvent e) { convertSelectionCase(2); }}));
+        caseMenu.add(mi("UPPERCASE", e -> convertSelectionCase(0)));
+        caseMenu.add(mi("lowercase", e -> convertSelectionCase(1)));
+        caseMenu.add(mi("Title Case", e -> convertSelectionCase(2)));
         edit.add(caseMenu);
 
-        JMenuItem dupLine = new JMenuItem(new AbstractAction("Duplicate Line") { public void actionPerformed(ActionEvent e) { duplicateLine(); }});
-        dupLine.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_D, Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx()));
-        edit.add(dupLine);
-        JMenuItem moveUp = new JMenuItem(new AbstractAction("Move Line Up") { public void actionPerformed(ActionEvent e) { moveLineUp(); }});
-        moveUp.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_UP, InputEvent.ALT_DOWN_MASK));
-        edit.add(moveUp);
-        JMenuItem moveDown = new JMenuItem(new AbstractAction("Move Line Down") { public void actionPerformed(ActionEvent e) { moveLineDown(); }});
-        moveDown.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_DOWN, InputEvent.ALT_DOWN_MASK));
-        edit.add(moveDown);
+        edit.add(mi("Duplicate Line", KeyStroke.getKeyStroke(KeyEvent.VK_D, MASK), e -> duplicateLine()));
+        edit.add(mi("Move Line Up", KeyStroke.getKeyStroke(KeyEvent.VK_UP, InputEvent.ALT_DOWN_MASK), e -> moveLine(-1)));
+        edit.add(mi("Move Line Down", KeyStroke.getKeyStroke(KeyEvent.VK_DOWN, InputEvent.ALT_DOWN_MASK), e -> moveLine(1)));
 
         JMenu format = new JMenu("Format");
         wordWrapItem = new JCheckBoxMenuItem("Word Wrap", PREFS.getBoolean("wordWrap", false));
@@ -295,30 +326,25 @@ public class Waqompad extends JFrame {
             for (EditorTab t : allTabs()) {
                 t.textArea.setLineWrap(wrap);
                 t.textArea.setWrapStyleWord(wrap);
-                t.scrollPane.setRowHeaderView((lineNumbersItem.isSelected() && !wrap) ? t.lineNumberArea : null);
             }
+            refreshLineNumberVisibility();
         });
         format.add(wordWrapItem);
         readOnlyItem = new JCheckBoxMenuItem("Read-Only Mode");
         readOnlyItem.addActionListener(e -> { EditorTab t = currentTab(); if (t != null) t.textArea.setEditable(!readOnlyItem.isSelected()); });
         format.add(readOnlyItem);
-        format.add(new JMenuItem(new AbstractAction("Font") { public void actionPerformed(ActionEvent e) { chooseFont(); }}));
+        format.add(mi("Font", e -> chooseFont()));
 
         JMenu view = new JMenu("View");
-        view.add(new JMenuItem(new AbstractAction("Zoom In") { public void actionPerformed(ActionEvent e) { setEditorFontSize(fontSize + 2); }}));
-        view.add(new JMenuItem(new AbstractAction("Zoom Out") { public void actionPerformed(ActionEvent e) { setEditorFontSize(fontSize - 2); }}));
-        view.add(new JMenuItem(new AbstractAction("Restore Default Zoom") { public void actionPerformed(ActionEvent e) { setEditorFontSize(18); }}));
+        view.add(mi("Zoom In", KeyStroke.getKeyStroke(KeyEvent.VK_EQUALS, MASK), e -> setEditorFontSize(fontSize + 2)));
+        view.add(mi("Zoom Out", KeyStroke.getKeyStroke(KeyEvent.VK_MINUS, MASK), e -> setEditorFontSize(fontSize - 2)));
+        view.add(mi("Restore Default Zoom", KeyStroke.getKeyStroke(KeyEvent.VK_0, MASK), e -> setEditorFontSize(18)));
         view.addSeparator();
         statusBarItem = new JCheckBoxMenuItem("Status Bar", true);
         statusBarItem.addActionListener(e -> statusPanel.setVisible(statusBarItem.isSelected()));
         view.add(statusBarItem);
         lineNumbersItem = new JCheckBoxMenuItem("Line Numbers", PREFS.getBoolean("lineNumbers", false));
-        lineNumbersItem.addActionListener(e -> {
-            boolean show = lineNumbersItem.isSelected();
-            for (EditorTab t : allTabs()) {
-                t.scrollPane.setRowHeaderView((show && !wordWrapItem.isSelected()) ? t.lineNumberArea : null);
-            }
-        });
+        lineNumbersItem.addActionListener(e -> refreshLineNumberVisibility());
         view.add(lineNumbersItem);
         alwaysOnTopItem = new JCheckBoxMenuItem("Always on Top", PREFS.getBoolean("alwaysOnTop", false));
         alwaysOnTopItem.addActionListener(e -> setAlwaysOnTop(alwaysOnTopItem.isSelected()));
@@ -326,25 +352,29 @@ public class Waqompad extends JFrame {
         setAlwaysOnTop(alwaysOnTopItem.isSelected());
         view.addSeparator();
         darkModeItem = new JCheckBoxMenuItem("Dark Mode", darkMode);
-        darkModeItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_D, Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx() | InputEvent.SHIFT_DOWN_MASK));
+        darkModeItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_D, MASK | InputEvent.SHIFT_DOWN_MASK));
         darkModeItem.addActionListener(e -> { darkMode = darkModeItem.isSelected(); applyTheme(); });
         view.add(darkModeItem);
 
         JMenu help = new JMenu("Help");
-        help.add(new JMenuItem(new AbstractAction("View Help") { public void actionPerformed(ActionEvent e) { JOptionPane.showMessageDialog(Waqompad.this, "WaqomPad Help\n\nUse File, Edit, Format, View and Help menus just like classic Notepad.\nOpen several files at once as tabs across the top; click a tab's \u2715 to close it.\nView > Dark Mode toggles the theme. View > Line Numbers shows a gutter.\nCtrl+Scroll zooms in and out.\nUnsaved work is auto-saved periodically per tab and offered back to you if WaqomPad closes unexpectedly."); }}));
-        help.add(new JMenuItem(new AbstractAction("Send Feedback") { public void actionPerformed(ActionEvent e) { JOptionPane.showMessageDialog(Waqompad.this, "Feedback is offline in this version. Share feedback manually."); }}));
-        help.add(new JMenuItem(new AbstractAction("About WaqomPad") { public void actionPerformed(ActionEvent e) { JOptionPane.showMessageDialog(Waqompad.this, "WaqomPad\nProfessional Java Swing Notepad\nNative cross-platform desktop text editor.", "About WaqomPad", JOptionPane.INFORMATION_MESSAGE); }}));
+        help.add(mi("View Help", e -> JOptionPane.showMessageDialog(this,
+                "WaqomPad Help\n\nUse File, Edit, Format, View and Help menus just like classic Notepad.\n"
+                + "Open several files at once as tabs across the top; click a tab's \u2715 to close it.\n"
+                + "View > Dark Mode toggles the theme. View > Line Numbers shows a gutter.\n"
+                + "Ctrl/Cmd+Scroll zooms in and out.\n"
+                + "Unsaved work is auto-saved periodically per tab and offered back to you if WaqomPad closes unexpectedly.")));
+        help.add(mi("Send Feedback", e -> JOptionPane.showMessageDialog(this, "Feedback is offline in this version. Share feedback manually.")));
+        help.add(mi("About WaqomPad", e -> JOptionPane.showMessageDialog(this,
+                "WaqomPad\nProfessional Java Swing Notepad\nNative cross-platform desktop text editor.",
+                "About WaqomPad", JOptionPane.INFORMATION_MESSAGE)));
 
         menuBar.add(file); menuBar.add(edit); menuBar.add(format); menuBar.add(view); menuBar.add(help);
         return menuBar;
     }
 
+    /** Menu item using the platform shortcut mask (Ctrl on Windows/Linux, Cmd on macOS) plus any extra modifier. */
     private JMenuItem createItem(String title, int key, int extraMask, ActionListener action) {
-        JMenuItem item = new JMenuItem(title);
-        int mask = Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx();
-        item.setAccelerator(KeyStroke.getKeyStroke(key, mask | extraMask));
-        item.addActionListener(action);
-        return item;
+        return mi(title, KeyStroke.getKeyStroke(key, MASK | extraMask), action);
     }
 
     private List<EditorTab> allTabs() {
@@ -360,8 +390,10 @@ public class Waqompad extends JFrame {
 
     private void markModified(EditorTab tab) {
         if (!tab.isModified) { tab.isModified = true; updateTabTitle(tab); }
-        tab.lineNumberArea.updateWidth();
-        if (currentTab() == tab) { updateStatusBar(); updateWordCount(); }
+        if (currentTab() != tab) return; // background tab edits never happen from typing; nothing else to refresh
+        updateStatusBar();
+        if (tab.lineNumberArea.isShowing()) tab.lineNumberArea.updateWidth();
+        wordCountDebounce.restart();
     }
 
     private void updateTitle() {
@@ -380,26 +412,35 @@ public class Waqompad extends JFrame {
         } catch (Exception ignored) {}
     }
 
+    private static final Pattern WHITESPACE = Pattern.compile("\\s+");
+
     private void updateWordCount() {
         EditorTab t = currentTab();
         if (t == null) { wordCountLabel.setText(""); return; }
         String text = t.textArea.getText();
         int chars = text.length();
         String trimmed = text.trim();
-        int words = trimmed.isEmpty() ? 0 : trimmed.split("\\s+").length;
+        int words = trimmed.isEmpty() ? 0 : WHITESPACE.split(trimmed).length;
         wordCountLabel.setText("Words: " + words + "  Chars: " + chars);
+    }
+
+    private void updateZoomLabel() {
+        int percent = Math.round(fontSize / 18f * 100);
+        zoomLabel.setText(percent + "%");
     }
 
     // ---------- Theme ----------
 
     private void applyTheme() {
-        for (EditorTab t : allTabs()) { applyThemeToTab(t); styleTabStrip(t); }
+        for (EditorTab t : allTabs()) applyThemeToTab(t);
         Color statusBg = darkMode ? DARK_STATUSBAR_BG : LIGHT_STATUSBAR_BG;
         Color fg = darkMode ? DARK_FG : LIGHT_FG;
         statusBar.setBackground(statusBg);
         statusBar.setForeground(fg);
         wordCountLabel.setBackground(statusBg);
         wordCountLabel.setForeground(fg);
+        zoomLabel.setBackground(statusBg);
+        zoomLabel.setForeground(fg);
         statusPanel.setBackground(statusBg);
         Color lineColor = darkMode ? new Color(55, 55, 55) : new Color(220, 220, 220);
         statusPanel.setBorder(BorderFactory.createMatteBorder(1, 0, 0, 0, lineColor));
@@ -429,9 +470,7 @@ public class Waqompad extends JFrame {
         tab.lineNumberArea.setBackground(darkMode ? DARK_GUTTER_BG : LIGHT_GUTTER_BG);
         tab.lineNumberArea.setForeground(darkMode ? DARK_GUTTER_FG : LIGHT_GUTTER_FG);
         tab.lineNumberArea.repaint();
-    }
 
-    private void styleTabStrip(EditorTab tab) {
         Color tabBg = darkMode ? DARK_MENU_BG : UIManager.getColor("TabbedPane.background");
         Color tabFg = darkMode ? DARK_MENU_FG : UIManager.getColor("TabbedPane.foreground");
         if (tab.tabComponent != null) {
@@ -728,40 +767,27 @@ public class Waqompad extends JFrame {
         } catch (Exception ignored) {}
     }
 
-    private void moveLineUp() {
+    /** Swaps the current line with the line above (direction -1) or below (direction +1), caret following the moved line. */
+    private void moveLine(int direction) {
         EditorTab t = currentTab(); if (t == null) return;
         try {
-            int caret = t.textArea.getCaretPosition();
-            int line = t.textArea.getLineOfOffset(caret);
-            if (line == 0) return;
-            int prevStart = t.textArea.getLineStartOffset(line - 1);
-            int prevEnd = t.textArea.getLineEndOffset(line - 1);
-            int curStart = t.textArea.getLineStartOffset(line);
-            int curEnd = t.textArea.getLineEndOffset(line);
-            String prevText = t.textArea.getText(prevStart, prevEnd - prevStart);
-            String curText = t.textArea.getText(curStart, curEnd - curStart);
-            int offsetInLine = caret - curStart;
-            t.textArea.replaceRange(curText + prevText, prevStart, curEnd);
-            t.textArea.setCaretPosition(prevStart + curText.length() + offsetInLine);
-        } catch (Exception ignored) {}
-    }
+            JTextArea ta = t.textArea;
+            int caret = ta.getCaretPosition();
+            int line = ta.getLineOfOffset(caret);
+            int other = line + direction;
+            if (other < 0 || other >= ta.getLineCount()) return;
 
-    private void moveLineDown() {
-        EditorTab t = currentTab(); if (t == null) return;
-        try {
-            int caret = t.textArea.getCaretPosition();
-            int line = t.textArea.getLineOfOffset(caret);
-            int lastLine = t.textArea.getLineCount() - 1;
-            if (line >= lastLine) return;
-            int curStart = t.textArea.getLineStartOffset(line);
-            int curEnd = t.textArea.getLineEndOffset(line);
-            int nextStart = t.textArea.getLineStartOffset(line + 1);
-            int nextEnd = t.textArea.getLineEndOffset(line + 1);
-            String curText = t.textArea.getText(curStart, curEnd - curStart);
-            String nextText = t.textArea.getText(nextStart, nextEnd - nextStart);
-            int offsetInLine = caret - curStart;
-            t.textArea.replaceRange(nextText + curText, curStart, nextEnd);
-            t.textArea.setCaretPosition(curStart + nextText.length() + offsetInLine);
+            int curStart = ta.getLineStartOffset(line), curEnd = ta.getLineEndOffset(line);
+            int otherStart = ta.getLineStartOffset(other), otherEnd = ta.getLineEndOffset(other);
+            String curText = ta.getText(curStart, curEnd - curStart);
+            String otherText = ta.getText(otherStart, otherEnd - otherStart);
+            int offset = caret - curStart;
+
+            int rangeStart = Math.min(curStart, otherStart);
+            int rangeEnd = Math.max(curEnd, otherEnd);
+            boolean up = direction < 0;
+            ta.replaceRange(up ? curText + otherText : otherText + curText, rangeStart, rangeEnd);
+            ta.setCaretPosition(rangeStart + (up ? 0 : otherText.length()) + offset);
         } catch (Exception ignored) {}
     }
 
@@ -783,6 +809,7 @@ public class Waqompad extends JFrame {
                 t.lineNumberArea.setFont(newFont);
                 t.lineNumberArea.updateWidth();
             }
+            updateZoomLabel();
         }
     }
 
@@ -790,12 +817,12 @@ public class Waqompad extends JFrame {
         if (size < 8 || size > 72) return;
         fontSize = size;
         for (EditorTab t : allTabs()) {
-            Font current = t.textArea.getFont();
-            Font newFont = new Font(current.getFamily(), current.getStyle(), fontSize);
+            Font newFont = t.textArea.getFont().deriveFont((float) fontSize);
             t.textArea.setFont(newFont);
             t.lineNumberArea.setFont(newFont);
             t.lineNumberArea.updateWidth();
         }
+        updateZoomLabel();
     }
 
     // ---------- Misc ----------
@@ -975,8 +1002,11 @@ public class Waqompad extends JFrame {
             int lines = Math.max(1, textArea.getLineCount());
             int digits = Math.max(2, String.valueOf(lines).length());
             int width = fm.charWidth('0') * digits + 16;
-            setPreferredSize(new Dimension(width, textArea.getHeight()));
-            revalidate();
+            Dimension current = getPreferredSize();
+            if (current == null || current.width != width) {
+                setPreferredSize(new Dimension(width, textArea.getHeight()));
+                revalidate();
+            }
             repaint();
         }
 
