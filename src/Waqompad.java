@@ -1,63 +1,58 @@
 import javax.swing.*;
+import javax.swing.border.Border;
 import javax.swing.event.*;
-import javax.swing.text.BadLocationException;
-import javax.swing.text.Utilities;
 import javax.swing.undo.*;
 import java.awt.*;
-import java.awt.datatransfer.DataFlavor;
-import java.awt.dnd.DnDConstants;
-import java.awt.dnd.DropTarget;
-import java.awt.dnd.DropTargetAdapter;
-import java.awt.dnd.DropTargetDropEvent;
 import java.awt.event.*;
-import java.awt.geom.Rectangle2D;
 import java.awt.print.PrinterException;
 import java.io.File;
+import java.io.IOException;
 import java.net.URI;
 import java.net.URLEncoder;
-import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
 import java.util.Date;
 import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.prefs.Preferences;
+import java.util.regex.PatternSyntaxException;
 
 public class Waqompad extends JFrame {
-    private final JTextArea textArea = new JTextArea();
-    private final JLabel positionLabel = new JLabel("Ln 1, Col 1");
-    private final JLabel wordCountLabel = new JLabel("0 words");
-    private final JPanel statusBar = new JPanel(new BorderLayout());
-    private final UndoManager undoManager = new UndoManager();
-    private File currentFile = null;
-    private boolean isModified = false;
-    private String lastFindText = "";
-    private int fontSize = 18;
-    private boolean darkMode = false;
-    private boolean lineNumbersEnabled = false;
-    private boolean readOnly = false;
-    private Charset currentEncoding = StandardCharsets.UTF_8;
-    private long lastKnownModified = 0L;
+
+    // ---------- Global (app-wide) state ----------
+    private static final Preferences PREFS = Preferences.userNodeForPackage(Waqompad.class);
+    private static final int MAX_RECENT = 5;
+    private static final AtomicBoolean RECOVERY_CHECKED = new AtomicBoolean(false);
+    private static final File AUTOSAVE_DIR = new File(System.getProperty("user.home"), ".waqompad_autosave");
 
     private final List<String> recentFiles = new ArrayList<>();
-    private final Preferences prefs = Preferences.userNodeForPackage(Waqompad.class);
-    private final File recoveryFile = new File(System.getProperty("user.home"), ".waqompad_recovery.tmp");
-    private Timer autosaveTimer;
+    private int fontSize = 18;
+    private boolean darkMode = false;
 
     private JMenuBar menuBar;
     private JMenu recentMenu;
-    private JScrollPane scrollPane;
-    private LineNumberGutter lineNumberGutter;
     private JCheckBoxMenuItem darkModeItem;
+    private JCheckBoxMenuItem wordWrapItem;
+    private JCheckBoxMenuItem lineNumbersItem;
+    private JCheckBoxMenuItem readOnlyItem;
+    private JCheckBoxMenuItem alwaysOnTopItem;
+    private JCheckBoxMenuItem statusBarItem;
+    private JTabbedPane tabbedPane;
+    private JPanel statusPanel;
+    private final JLabel statusBar = new JLabel("Ln 1, Col 1");
+    private final JLabel wordCountLabel = new JLabel("Words: 0  Chars: 0");
+    private javax.swing.Timer autoSaveTimer;
 
     // Theme colors
     private static final Color LIGHT_BG = Color.WHITE;
     private static final Color LIGHT_FG = Color.BLACK;
     private static final Color LIGHT_SELECTION = new Color(180, 213, 255);
     private static final Color LIGHT_STATUSBAR_BG = new Color(240, 240, 240);
+    private static final Color LIGHT_GUTTER_BG = new Color(245, 245, 245);
+    private static final Color LIGHT_GUTTER_FG = new Color(120, 120, 120);
 
     private static final Color DARK_BG = new Color(30, 30, 30);
     private static final Color DARK_FG = new Color(220, 220, 220);
@@ -65,130 +60,190 @@ public class Waqompad extends JFrame {
     private static final Color DARK_STATUSBAR_BG = new Color(45, 45, 45);
     private static final Color DARK_MENU_BG = new Color(40, 40, 40);
     private static final Color DARK_MENU_FG = new Color(220, 220, 220);
+    private static final Color DARK_GUTTER_BG = new Color(37, 37, 37);
+    private static final Color DARK_GUTTER_FG = new Color(130, 130, 130);
 
     public static void main(String[] args) {
         SwingUtilities.invokeLater(() -> {
             try {
                 System.setProperty("apple.awt.application.name", "WaqomPad");
-                UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
+                // Cross-platform (Metal) L&F is used instead of the native one: native look-and-feels
+                // (Aqua on macOS in particular) ignore custom menu/tab colors and center-align tabs,
+                // which broke dark-mode readability and tab placement.
+                UIManager.setLookAndFeel(UIManager.getCrossPlatformLookAndFeelClassName());
+                flattenLookAndFeel();
             } catch (Exception ignored) {}
             new Waqompad().setVisible(true);
         });
     }
 
+    /**
+     * Strips down Metal L&F's default chrome (borders, insets, heavier fonts) so the app reads
+     * as a plain, flat text editor rather than a generic Java app — closer to Notepad's minimal style.
+     */
+    private static void flattenLookAndFeel() {
+        Font uiFont = new Font(Font.SANS_SERIF, Font.PLAIN, 13);
+        String[] fontKeys = {
+            "MenuBar.font", "Menu.font", "MenuItem.font", "CheckBoxMenuItem.font", "RadioButtonMenuItem.font",
+            "Label.font", "Button.font", "TextField.font", "TextArea.font", "OptionPane.font",
+            "OptionPane.messageFont", "OptionPane.buttonFont", "TabbedPane.font", "CheckBox.font",
+            "ComboBox.font", "Spinner.font", "ToolTip.font"
+        };
+        for (String key : fontKeys) UIManager.put(key, uiFont);
+
+        Border flatMenuItemBorder = BorderFactory.createEmptyBorder(4, 12, 4, 12);
+        UIManager.put("Menu.border", flatMenuItemBorder);
+        UIManager.put("MenuItem.border", flatMenuItemBorder);
+        UIManager.put("CheckBoxMenuItem.border", flatMenuItemBorder);
+        UIManager.put("PopupMenu.border", BorderFactory.createLineBorder(new Color(200, 200, 200)));
+        UIManager.put("MenuBar.border", BorderFactory.createEmptyBorder(2, 4, 2, 4));
+
+        UIManager.put("TabbedPane.tabInsets", new Insets(6, 14, 6, 14));
+        UIManager.put("TabbedPane.contentBorderInsets", new Insets(0, 0, 0, 0));
+        UIManager.put("TabbedPane.selectedTabPadInsets", new Insets(0, 0, 0, 0));
+        UIManager.put("TabbedPane.tabsOverlapBorder", false);
+
+        UIManager.put("ScrollPane.border", BorderFactory.createEmptyBorder());
+        UIManager.put("SplitPane.border", BorderFactory.createEmptyBorder());
+        UIManager.put("Button.margin", new Insets(4, 10, 4, 10));
+    }
+
     public Waqompad() {
         super("Untitled - WaqomPad");
-
-        // ---- Load persisted preferences ----
-        String fontFamily = Font.MONOSPACED;
-        int winX = -1, winY = -1, winW = 1100, winH = 720;
-        try {
-            darkMode = prefs.getBoolean("darkMode", false);
-            fontSize = prefs.getInt("fontSize", 18);
-            fontFamily = prefs.get("fontFamily", Font.MONOSPACED);
-            lineNumbersEnabled = prefs.getBoolean("lineNumbers", false);
-            currentEncoding = Charset.forName(prefs.get("encoding", "UTF-8"));
-            winX = prefs.getInt("winX", -1);
-            winY = prefs.getInt("winY", -1);
-            winW = prefs.getInt("winW", 1100);
-            winH = prefs.getInt("winH", 720);
-            String saved = prefs.get("recentFiles", "");
-            if (!saved.isEmpty()) {
-                for (String p : saved.split("\n")) if (!p.isBlank()) recentFiles.add(p);
-            }
-        } catch (Exception ignored) {}
-
         setDefaultCloseOperation(DO_NOTHING_ON_CLOSE);
-        if (winX >= 0 && winY >= 0) {
-            setBounds(winX, winY, winW, winH);
-        } else {
-            setSize(winW, winH);
-            setLocationRelativeTo(null);
-        }
+        loadPreferences();
+
+        setSize(1100, 720);
         setIconImage(loadIcon());
 
-        textArea.setFont(new Font(fontFamily, Font.PLAIN, fontSize));
-        textArea.setBackground(Color.WHITE);
-        textArea.setForeground(Color.BLACK);
-        textArea.setCaretColor(Color.BLACK);
-        textArea.setMargin(new Insets(4, 6, 4, 6));
-        textArea.setLineWrap(false);
-        textArea.setWrapStyleWord(false);
-        textArea.setDropTarget(new DropTarget(textArea, new DropTargetAdapter() {
-            @Override
-            public void drop(DropTargetDropEvent event) {
-                try {
-                    event.acceptDrop(DnDConstants.ACTION_COPY);
-                    @SuppressWarnings("unchecked")
-                    List<File> files = (List<File>) event.getTransferable().getTransferData(DataFlavor.javaFileListFlavor);
-                    if (!files.isEmpty()) {
-                        if (!confirmSaveChanges()) return;
-                        loadFileIntoEditor(files.get(0));
-                    }
-                } catch (Exception ignored) {}
-            }
-        }));
-
-        lineNumberGutter = new LineNumberGutter();
-        scrollPane = new JScrollPane(textArea);
-        if (lineNumbersEnabled) scrollPane.setRowHeaderView(lineNumberGutter);
-        scrollPane.addMouseWheelListener(e -> {
-            if (e.isControlDown()) {
-                setEditorFontSize(fontSize + (e.getWheelRotation() < 0 ? 2 : -2));
-                e.consume();
-            }
-        });
-        add(scrollPane, BorderLayout.CENTER);
+        tabbedPane = new JTabbedPane();
+        tabbedPane.setBorder(BorderFactory.createEmptyBorder());
+        tabbedPane.addChangeListener(e -> onTabChanged());
+        add(tabbedPane, BorderLayout.CENTER);
 
         statusBar.setBorder(BorderFactory.createEmptyBorder(4, 8, 4, 8));
-        statusBar.setOpaque(true);
-        statusBar.add(positionLabel, BorderLayout.WEST);
-        statusBar.add(wordCountLabel, BorderLayout.EAST);
-        add(statusBar, BorderLayout.SOUTH);
+        wordCountLabel.setBorder(BorderFactory.createEmptyBorder(4, 8, 4, 8));
+        statusPanel = new JPanel(new BorderLayout());
+        statusPanel.add(statusBar, BorderLayout.WEST);
+        statusPanel.add(wordCountLabel, BorderLayout.EAST);
+        statusPanel.setOpaque(true);
+        add(statusPanel, BorderLayout.SOUTH);
 
         menuBar = createMenuBar();
         setJMenuBar(menuBar);
-        rebuildRecentMenu();
 
-        textArea.getDocument().addUndoableEditListener(e -> undoManager.addEdit(e.getEdit()));
-        textArea.getDocument().addDocumentListener(new DocumentListener() {
-            public void insertUpdate(DocumentEvent e) { markModified(); }
-            public void removeUpdate(DocumentEvent e) { markModified(); }
-            public void changedUpdate(DocumentEvent e) { markModified(); }
-        });
-        textArea.addCaretListener(e -> updateStatusBar());
+        applySavedWindowBounds();
         addWindowListener(new WindowAdapter() { public void windowClosing(WindowEvent e) { exitApp(); } });
-        addWindowFocusListener(new WindowAdapter() {
-            @Override public void windowGainedFocus(WindowEvent e) { checkExternalModification(); }
-        });
 
-        isModified = false;
+        AUTOSAVE_DIR.mkdirs();
+        addTab("Untitled");
+        setupAutoSave();
+        if (RECOVERY_CHECKED.compareAndSet(false, true)) checkForRecovery();
+
         updateTitle();
         updateStatusBar();
+        updateWordCount();
         applyTheme();
-
-        autosaveTimer = new Timer(30_000, e -> autoSaveRecovery());
-        autosaveTimer.start();
-        SwingUtilities.invokeLater(this::checkForRecovery);
+        rebuildRecentMenu();
     }
+
+    // ---------- Tab helpers ----------
+
+    private EditorTab currentTab() {
+        Component c = tabbedPane.getSelectedComponent();
+        return c instanceof EditorTab ? (EditorTab) c : null;
+    }
+
+    private EditorTab addTab(String title) {
+        EditorTab tab = new EditorTab();
+        tab.textArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, fontSize));
+        tab.textArea.setMargin(new Insets(4, 6, 4, 6));
+        boolean wrap = wordWrapItem != null && wordWrapItem.isSelected();
+        tab.textArea.setLineWrap(wrap);
+        tab.textArea.setWrapStyleWord(wrap);
+        boolean showLines = lineNumbersItem != null && lineNumbersItem.isSelected();
+        tab.scrollPane.setRowHeaderView(showLines && !wrap ? tab.lineNumberArea : null);
+
+        tabbedPane.addTab(title, tab);
+        setupTabComponent(tab, title);
+        wireTabListeners(tab);
+        tabbedPane.setSelectedComponent(tab);
+        applyThemeToTab(tab);
+        styleTabStrip(tab);
+        return tab;
+    }
+
+    private void setupTabComponent(EditorTab tab, String title) {
+        JPanel tabComp = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+        tabComp.setOpaque(false);
+        tabComp.setBorder(BorderFactory.createEmptyBorder(2, 2, 2, 0));
+        JLabel label = new JLabel(title);
+        tab.titleLabel = label;
+        JButton closeBtn = new JButton("\u2715");
+        closeBtn.setFont(closeBtn.getFont().deriveFont(10f));
+        closeBtn.setMargin(new Insets(0, 2, 0, 2));
+        closeBtn.setContentAreaFilled(false);
+        closeBtn.setBorderPainted(false);
+        closeBtn.setFocusPainted(false);
+        closeBtn.setToolTipText("Close tab");
+        closeBtn.addActionListener(e -> closeTab(tab));
+        tabComp.add(label);
+        tabComp.add(closeBtn);
+        tab.tabComponent = tabComp;
+        tab.closeButton = closeBtn;
+        int idx = tabbedPane.indexOfComponent(tab);
+        if (idx >= 0) tabbedPane.setTabComponentAt(idx, tabComp);
+    }
+
+    private void wireTabListeners(EditorTab tab) {
+        tab.textArea.getDocument().addUndoableEditListener(e -> tab.undoManager.addEdit(e.getEdit()));
+        tab.textArea.getDocument().addDocumentListener(new DocumentListener() {
+            public void insertUpdate(DocumentEvent e) { markModified(tab); }
+            public void removeUpdate(DocumentEvent e) { markModified(tab); }
+            public void changedUpdate(DocumentEvent e) { markModified(tab); }
+        });
+        tab.textArea.addCaretListener(e -> { if (currentTab() == tab) updateStatusBar(); });
+        tab.textArea.addMouseWheelListener(e -> {
+            if ((e.getModifiersEx() & InputEvent.CTRL_DOWN_MASK) != 0) {
+                setEditorFontSize(fontSize - e.getWheelRotation() * 2);
+                e.consume();
+            }
+        });
+    }
+
+    private void onTabChanged() {
+        EditorTab tab = currentTab();
+        updateTitle();
+        updateStatusBar();
+        updateWordCount();
+        if (tab != null && readOnlyItem != null) readOnlyItem.setSelected(!tab.textArea.isEditable());
+    }
+
+    private String tabLabel(EditorTab tab) {
+        return (tab.isModified ? "*" : "") + (tab.currentFile == null ? "Untitled" : tab.currentFile.getName());
+    }
+
+    private void updateTabTitle(EditorTab tab) {
+        String label = tabLabel(tab);
+        if (tab.titleLabel != null) tab.titleLabel.setText(label);
+        int idx = tabbedPane.indexOfComponent(tab);
+        if (idx >= 0) tabbedPane.setTitleAt(idx, label);
+        if (currentTab() == tab) updateTitle();
+    }
+
+    // ---------- Menu ----------
 
     private JMenuBar createMenuBar() {
         JMenuBar menuBar = new JMenuBar();
         JMenu file = new JMenu("File");
-        file.add(createItem("New", KeyEvent.VK_N, 0, e -> newFile()));
+        file.add(createItem("New Tab", KeyEvent.VK_N, 0, e -> newTab()));
         file.add(createItem("New Window", KeyEvent.VK_N, InputEvent.SHIFT_DOWN_MASK, e -> new Waqompad().setVisible(true)));
         file.add(createItem("Open", KeyEvent.VK_O, 0, e -> openFile()));
-        recentMenu = new JMenu("Recent Files");
+        recentMenu = new JMenu("Open Recent");
         file.add(recentMenu);
-        file.add(createItem("Save", KeyEvent.VK_S, 0, e -> saveFile()));
-        file.add(createItem("Save As", KeyEvent.VK_S, InputEvent.SHIFT_DOWN_MASK, e -> saveAsFile()));
-        file.addSeparator();
-        JMenu encodingMenu = new JMenu("Encoding");
-        ButtonGroup encodingGroup = new ButtonGroup();
-        addEncodingItem(encodingMenu, encodingGroup, "UTF-8", StandardCharsets.UTF_8);
-        addEncodingItem(encodingMenu, encodingGroup, "UTF-16", StandardCharsets.UTF_16);
-        addEncodingItem(encodingMenu, encodingGroup, "ANSI (ISO-8859-1)", StandardCharsets.ISO_8859_1);
-        file.add(encodingMenu);
+        file.add(createItem("Save", KeyEvent.VK_S, 0, e -> { EditorTab t = currentTab(); if (t != null) saveTab(t); }));
+        file.add(createItem("Save As", KeyEvent.VK_S, InputEvent.SHIFT_DOWN_MASK, e -> { EditorTab t = currentTab(); if (t != null) saveTabAs(t); }));
+        file.add(createItem("Close Tab", KeyEvent.VK_W, 0, e -> { EditorTab t = currentTab(); if (t != null) closeTab(t); }));
         file.addSeparator();
         file.add(new JMenuItem(new AbstractAction("Page Setup") { public void actionPerformed(ActionEvent e) { JOptionPane.showMessageDialog(Waqompad.this, "Page setup is handled by the native print dialog."); }}));
         file.add(createItem("Print", KeyEvent.VK_P, 0, e -> printFile()));
@@ -196,13 +251,13 @@ public class Waqompad extends JFrame {
         file.add(new JMenuItem(new AbstractAction("Exit") { public void actionPerformed(ActionEvent e) { exitApp(); }}));
 
         JMenu edit = new JMenu("Edit");
-        edit.add(createItem("Undo", KeyEvent.VK_Z, 0, e -> { if (undoManager.canUndo()) undoManager.undo(); }));
-        edit.add(createItem("Redo", KeyEvent.VK_Y, 0, e -> { if (undoManager.canRedo()) undoManager.redo(); }));
+        edit.add(createItem("Undo", KeyEvent.VK_Z, 0, e -> { EditorTab t = currentTab(); if (t != null && t.undoManager.canUndo()) t.undoManager.undo(); }));
+        edit.add(createItem("Redo", KeyEvent.VK_Y, 0, e -> { EditorTab t = currentTab(); if (t != null && t.undoManager.canRedo()) t.undoManager.redo(); }));
         edit.addSeparator();
-        edit.add(createItem("Cut", KeyEvent.VK_X, 0, e -> textArea.cut()));
-        edit.add(createItem("Copy", KeyEvent.VK_C, 0, e -> textArea.copy()));
-        edit.add(createItem("Paste", KeyEvent.VK_V, 0, e -> textArea.paste()));
-        edit.add(new JMenuItem(new AbstractAction("Delete") { public void actionPerformed(ActionEvent e) { textArea.replaceSelection(""); }}));
+        edit.add(createItem("Cut", KeyEvent.VK_X, 0, e -> { EditorTab t = currentTab(); if (t != null) t.textArea.cut(); }));
+        edit.add(createItem("Copy", KeyEvent.VK_C, 0, e -> { EditorTab t = currentTab(); if (t != null) t.textArea.copy(); }));
+        edit.add(createItem("Paste", KeyEvent.VK_V, 0, e -> { EditorTab t = currentTab(); if (t != null) t.textArea.paste(); }));
+        edit.add(new JMenuItem(new AbstractAction("Delete") { public void actionPerformed(ActionEvent e) { EditorTab t = currentTab(); if (t != null) t.textArea.replaceSelection(""); }}));
         edit.addSeparator();
         edit.add(new JMenuItem(new AbstractAction("Search with Bing") { public void actionPerformed(ActionEvent e) { searchWithBing(); }}));
         edit.add(createItem("Find", KeyEvent.VK_F, 0, e -> showFindDialog()));
@@ -211,39 +266,42 @@ public class Waqompad extends JFrame {
         edit.add(createItem("Replace", KeyEvent.VK_H, 0, e -> showReplaceDialog()));
         edit.add(createItem("Go To", KeyEvent.VK_G, 0, e -> goToLine()));
         edit.addSeparator();
-        edit.add(createItem("Select All", KeyEvent.VK_A, 0, e -> textArea.selectAll()));
+        edit.add(createItem("Select All", KeyEvent.VK_A, 0, e -> { EditorTab t = currentTab(); if (t != null) t.textArea.selectAll(); }));
         JMenuItem timeDate = new JMenuItem(new AbstractAction("Time/Date") { public void actionPerformed(ActionEvent e) { insertTimeDate(); }});
         timeDate.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_F5, 0));
         edit.add(timeDate);
         edit.addSeparator();
 
-        JMenuItem duplicateLineItem = new JMenuItem(new AbstractAction("Duplicate Line") { public void actionPerformed(ActionEvent e) { duplicateLine(); }});
-        duplicateLineItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_D, Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx()));
-        edit.add(duplicateLineItem);
-        JMenuItem moveUpItem = new JMenuItem(new AbstractAction("Move Line Up") { public void actionPerformed(ActionEvent e) { moveLine(true); }});
-        moveUpItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_UP, InputEvent.ALT_DOWN_MASK));
-        edit.add(moveUpItem);
-        JMenuItem moveDownItem = new JMenuItem(new AbstractAction("Move Line Down") { public void actionPerformed(ActionEvent e) { moveLine(false); }});
-        moveDownItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_DOWN, InputEvent.ALT_DOWN_MASK));
-        edit.add(moveDownItem);
-        edit.addSeparator();
-
         JMenu caseMenu = new JMenu("Convert Case");
-        caseMenu.add(new JMenuItem(new AbstractAction("UPPERCASE") { public void actionPerformed(ActionEvent e) { convertCase(0); }}));
-        caseMenu.add(new JMenuItem(new AbstractAction("lowercase") { public void actionPerformed(ActionEvent e) { convertCase(1); }}));
-        caseMenu.add(new JMenuItem(new AbstractAction("Title Case") { public void actionPerformed(ActionEvent e) { convertCase(2); }}));
+        caseMenu.add(new JMenuItem(new AbstractAction("UPPERCASE") { public void actionPerformed(ActionEvent e) { convertSelectionCase(0); }}));
+        caseMenu.add(new JMenuItem(new AbstractAction("lowercase") { public void actionPerformed(ActionEvent e) { convertSelectionCase(1); }}));
+        caseMenu.add(new JMenuItem(new AbstractAction("Title Case") { public void actionPerformed(ActionEvent e) { convertSelectionCase(2); }}));
         edit.add(caseMenu);
-        edit.add(new JMenuItem(new AbstractAction("Sort Lines") { public void actionPerformed(ActionEvent e) { sortLines(); }}));
-        edit.addSeparator();
-        JCheckBoxMenuItem readOnlyItem = new JCheckBoxMenuItem("Read-Only Mode", readOnly);
-        readOnlyItem.addActionListener(e -> { readOnly = readOnlyItem.isSelected(); textArea.setEditable(!readOnly); });
-        edit.add(readOnlyItem);
-        edit.add(new JMenuItem(new AbstractAction("Word Count...") { public void actionPerformed(ActionEvent e) { showWordCount(); }}));
+
+        JMenuItem dupLine = new JMenuItem(new AbstractAction("Duplicate Line") { public void actionPerformed(ActionEvent e) { duplicateLine(); }});
+        dupLine.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_D, Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx()));
+        edit.add(dupLine);
+        JMenuItem moveUp = new JMenuItem(new AbstractAction("Move Line Up") { public void actionPerformed(ActionEvent e) { moveLineUp(); }});
+        moveUp.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_UP, InputEvent.ALT_DOWN_MASK));
+        edit.add(moveUp);
+        JMenuItem moveDown = new JMenuItem(new AbstractAction("Move Line Down") { public void actionPerformed(ActionEvent e) { moveLineDown(); }});
+        moveDown.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_DOWN, InputEvent.ALT_DOWN_MASK));
+        edit.add(moveDown);
 
         JMenu format = new JMenu("Format");
-        JCheckBoxMenuItem wordWrap = new JCheckBoxMenuItem("Word Wrap");
-        wordWrap.addActionListener(e -> { textArea.setLineWrap(wordWrap.isSelected()); textArea.setWrapStyleWord(wordWrap.isSelected()); });
-        format.add(wordWrap);
+        wordWrapItem = new JCheckBoxMenuItem("Word Wrap", PREFS.getBoolean("wordWrap", false));
+        wordWrapItem.addActionListener(e -> {
+            boolean wrap = wordWrapItem.isSelected();
+            for (EditorTab t : allTabs()) {
+                t.textArea.setLineWrap(wrap);
+                t.textArea.setWrapStyleWord(wrap);
+                t.scrollPane.setRowHeaderView((lineNumbersItem.isSelected() && !wrap) ? t.lineNumberArea : null);
+            }
+        });
+        format.add(wordWrapItem);
+        readOnlyItem = new JCheckBoxMenuItem("Read-Only Mode");
+        readOnlyItem.addActionListener(e -> { EditorTab t = currentTab(); if (t != null) t.textArea.setEditable(!readOnlyItem.isSelected()); });
+        format.add(readOnlyItem);
         format.add(new JMenuItem(new AbstractAction("Font") { public void actionPerformed(ActionEvent e) { chooseFont(); }}));
 
         JMenu view = new JMenu("View");
@@ -251,41 +309,34 @@ public class Waqompad extends JFrame {
         view.add(new JMenuItem(new AbstractAction("Zoom Out") { public void actionPerformed(ActionEvent e) { setEditorFontSize(fontSize - 2); }}));
         view.add(new JMenuItem(new AbstractAction("Restore Default Zoom") { public void actionPerformed(ActionEvent e) { setEditorFontSize(18); }}));
         view.addSeparator();
-        JCheckBoxMenuItem status = new JCheckBoxMenuItem("Status Bar", true);
-        status.addActionListener(e -> statusBar.setVisible(status.isSelected()));
-        view.add(status);
-        JCheckBoxMenuItem lineNumbersItem = new JCheckBoxMenuItem("Line Numbers", lineNumbersEnabled);
+        statusBarItem = new JCheckBoxMenuItem("Status Bar", true);
+        statusBarItem.addActionListener(e -> statusPanel.setVisible(statusBarItem.isSelected()));
+        view.add(statusBarItem);
+        lineNumbersItem = new JCheckBoxMenuItem("Line Numbers", PREFS.getBoolean("lineNumbers", false));
         lineNumbersItem.addActionListener(e -> {
-            lineNumbersEnabled = lineNumbersItem.isSelected();
-            scrollPane.setRowHeaderView(lineNumbersEnabled ? lineNumberGutter : null);
+            boolean show = lineNumbersItem.isSelected();
+            for (EditorTab t : allTabs()) {
+                t.scrollPane.setRowHeaderView((show && !wordWrapItem.isSelected()) ? t.lineNumberArea : null);
+            }
         });
         view.add(lineNumbersItem);
+        alwaysOnTopItem = new JCheckBoxMenuItem("Always on Top", PREFS.getBoolean("alwaysOnTop", false));
+        alwaysOnTopItem.addActionListener(e -> setAlwaysOnTop(alwaysOnTopItem.isSelected()));
+        view.add(alwaysOnTopItem);
+        setAlwaysOnTop(alwaysOnTopItem.isSelected());
         view.addSeparator();
         darkModeItem = new JCheckBoxMenuItem("Dark Mode", darkMode);
         darkModeItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_D, Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx() | InputEvent.SHIFT_DOWN_MASK));
         darkModeItem.addActionListener(e -> { darkMode = darkModeItem.isSelected(); applyTheme(); });
         view.add(darkModeItem);
-        JCheckBoxMenuItem alwaysOnTopItem = new JCheckBoxMenuItem("Always on Top");
-        alwaysOnTopItem.addActionListener(e -> {
-            try { setAlwaysOnTop(alwaysOnTopItem.isSelected()); }
-            catch (Exception ex) { JOptionPane.showMessageDialog(Waqompad.this, "Always on top is not supported on this platform."); alwaysOnTopItem.setSelected(false); }
-        });
-        view.add(alwaysOnTopItem);
 
         JMenu help = new JMenu("Help");
-        help.add(new JMenuItem(new AbstractAction("View Help") { public void actionPerformed(ActionEvent e) { JOptionPane.showMessageDialog(Waqompad.this, "WaqomPad Help\n\nUse File, Edit, Format, View and Help menus just like classic Notepad.\nToggle View > Dark Mode to switch themes.\nDrag and drop a file onto the editor to open it."); }}));
+        help.add(new JMenuItem(new AbstractAction("View Help") { public void actionPerformed(ActionEvent e) { JOptionPane.showMessageDialog(Waqompad.this, "WaqomPad Help\n\nUse File, Edit, Format, View and Help menus just like classic Notepad.\nOpen several files at once as tabs across the top; click a tab's \u2715 to close it.\nView > Dark Mode toggles the theme. View > Line Numbers shows a gutter.\nCtrl+Scroll zooms in and out.\nUnsaved work is auto-saved periodically per tab and offered back to you if WaqomPad closes unexpectedly."); }}));
         help.add(new JMenuItem(new AbstractAction("Send Feedback") { public void actionPerformed(ActionEvent e) { JOptionPane.showMessageDialog(Waqompad.this, "Feedback is offline in this version. Share feedback manually."); }}));
         help.add(new JMenuItem(new AbstractAction("About WaqomPad") { public void actionPerformed(ActionEvent e) { JOptionPane.showMessageDialog(Waqompad.this, "WaqomPad\nProfessional Java Swing Notepad\nNative cross-platform desktop text editor.", "About WaqomPad", JOptionPane.INFORMATION_MESSAGE); }}));
 
         menuBar.add(file); menuBar.add(edit); menuBar.add(format); menuBar.add(view); menuBar.add(help);
         return menuBar;
-    }
-
-    private void addEncodingItem(JMenu menu, ButtonGroup group, String label, Charset charset) {
-        JRadioButtonMenuItem item = new JRadioButtonMenuItem(label, currentEncoding.equals(charset));
-        item.addActionListener(e -> currentEncoding = charset);
-        group.add(item);
-        menu.add(item);
     }
 
     private JMenuItem createItem(String title, int key, int extraMask, ActionListener action) {
@@ -296,69 +347,99 @@ public class Waqompad extends JFrame {
         return item;
     }
 
-    private void markModified() { if (!isModified) { isModified = true; updateTitle(); } updateStatusBar(); }
-    private void updateTitle() { String name = currentFile == null ? "Untitled" : currentFile.getName(); setTitle((isModified ? "*" : "") + name + " - WaqomPad"); }
+    private List<EditorTab> allTabs() {
+        List<EditorTab> list = new ArrayList<>();
+        for (int i = 0; i < tabbedPane.getTabCount(); i++) {
+            Component c = tabbedPane.getComponentAt(i);
+            if (c instanceof EditorTab) list.add((EditorTab) c);
+        }
+        return list;
+    }
+
+    // ---------- Status bar / title ----------
+
+    private void markModified(EditorTab tab) {
+        if (!tab.isModified) { tab.isModified = true; updateTabTitle(tab); }
+        tab.lineNumberArea.updateWidth();
+        if (currentTab() == tab) { updateStatusBar(); updateWordCount(); }
+    }
+
+    private void updateTitle() {
+        EditorTab t = currentTab();
+        setTitle((t == null ? "WaqomPad" : tabLabel(t) + " - WaqomPad"));
+    }
 
     private void updateStatusBar() {
+        EditorTab t = currentTab();
+        if (t == null) { statusBar.setText(""); return; }
         try {
-            int pos = textArea.getCaretPosition();
-            int line = textArea.getLineOfOffset(pos);
-            int col = pos - textArea.getLineStartOffset(line);
-            positionLabel.setText("Ln " + (line + 1) + ", Col " + (col + 1));
+            int pos = t.textArea.getCaretPosition();
+            int line = t.textArea.getLineOfOffset(pos);
+            int col = pos - t.textArea.getLineStartOffset(line);
+            statusBar.setText("Ln " + (line + 1) + ", Col " + (col + 1));
         } catch (Exception ignored) {}
-        updateWordCount();
-        if (lineNumbersEnabled) { lineNumberGutter.revalidate(); lineNumberGutter.repaint(); }
     }
 
     private void updateWordCount() {
-        String text = textArea.getText();
-        String trimmed = text.trim();
-        int words = trimmed.isEmpty() ? 0 : trimmed.split("\\s+").length;
-        wordCountLabel.setText(words + " words, " + text.length() + " chars");
-    }
-
-    private void showWordCount() {
-        String text = textArea.getText();
-        String trimmed = text.trim();
-        int words = trimmed.isEmpty() ? 0 : trimmed.split("\\s+").length;
+        EditorTab t = currentTab();
+        if (t == null) { wordCountLabel.setText(""); return; }
+        String text = t.textArea.getText();
         int chars = text.length();
-        int charsNoSpaces = text.replaceAll("\\s", "").length();
-        int lines = textArea.getLineCount();
-        JOptionPane.showMessageDialog(this,
-                "Lines: " + lines + "\nWords: " + words + "\nCharacters: " + chars + "\nCharacters (no spaces): " + charsNoSpaces,
-                "Word Count", JOptionPane.INFORMATION_MESSAGE);
+        String trimmed = text.trim();
+        int words = trimmed.isEmpty() ? 0 : trimmed.split("\\s+").length;
+        wordCountLabel.setText("Words: " + words + "  Chars: " + chars);
     }
 
-    /**
-     * Applies the current theme (dark or light) to all UI components:
-     * the text area, status bar, menu bar, and content pane.
-     */
+    // ---------- Theme ----------
+
     private void applyTheme() {
+        for (EditorTab t : allTabs()) { applyThemeToTab(t); styleTabStrip(t); }
+        Color statusBg = darkMode ? DARK_STATUSBAR_BG : LIGHT_STATUSBAR_BG;
+        Color fg = darkMode ? DARK_FG : LIGHT_FG;
+        statusBar.setBackground(statusBg);
+        statusBar.setForeground(fg);
+        wordCountLabel.setBackground(statusBg);
+        wordCountLabel.setForeground(fg);
+        statusPanel.setBackground(statusBg);
+        Color lineColor = darkMode ? new Color(55, 55, 55) : new Color(220, 220, 220);
+        statusPanel.setBorder(BorderFactory.createMatteBorder(1, 0, 0, 0, lineColor));
+        getContentPane().setBackground(darkMode ? DARK_BG : LIGHT_BG);
+        if (tabbedPane != null) {
+            tabbedPane.setBackground(darkMode ? DARK_MENU_BG : UIManager.getColor("TabbedPane.background"));
+            tabbedPane.setForeground(darkMode ? DARK_MENU_FG : UIManager.getColor("TabbedPane.foreground"));
+        }
+        if (menuBar != null) applyMenuTheme(menuBar, darkMode);
+        repaint();
+    }
+
+    private void applyThemeToTab(EditorTab tab) {
         Color bg = darkMode ? DARK_BG : LIGHT_BG;
         Color fg = darkMode ? DARK_FG : LIGHT_FG;
         Color selection = darkMode ? DARK_SELECTION : LIGHT_SELECTION;
-        Color statusBg = darkMode ? DARK_STATUSBAR_BG : LIGHT_STATUSBAR_BG;
-        Color secondaryFg = darkMode ? new Color(160, 160, 160) : new Color(90, 90, 90);
 
-        textArea.setBackground(bg);
-        textArea.setForeground(fg);
-        textArea.setCaretColor(fg);
-        textArea.setSelectionColor(selection);
-        textArea.setSelectedTextColor(darkMode ? Color.WHITE : Color.BLACK);
+        tab.textArea.setBackground(bg);
+        tab.textArea.setForeground(fg);
+        tab.textArea.setCaretColor(fg);
+        tab.textArea.setSelectionColor(selection);
+        tab.textArea.setSelectedTextColor(darkMode ? Color.WHITE : Color.BLACK);
 
-        statusBar.setBackground(statusBg);
-        positionLabel.setForeground(fg);
-        wordCountLabel.setForeground(secondaryFg);
+        tab.scrollPane.getViewport().setBackground(bg);
+        tab.scrollPane.setBackground(bg);
 
-        getContentPane().setBackground(bg);
-        if (scrollPane != null) {
-            scrollPane.getViewport().setBackground(bg);
-            scrollPane.setBackground(bg);
+        tab.lineNumberArea.setBackground(darkMode ? DARK_GUTTER_BG : LIGHT_GUTTER_BG);
+        tab.lineNumberArea.setForeground(darkMode ? DARK_GUTTER_FG : LIGHT_GUTTER_FG);
+        tab.lineNumberArea.repaint();
+    }
+
+    private void styleTabStrip(EditorTab tab) {
+        Color tabBg = darkMode ? DARK_MENU_BG : UIManager.getColor("TabbedPane.background");
+        Color tabFg = darkMode ? DARK_MENU_FG : UIManager.getColor("TabbedPane.foreground");
+        if (tab.tabComponent != null) {
+            tab.tabComponent.setOpaque(true);
+            tab.tabComponent.setBackground(tabBg);
         }
-        if (lineNumberGutter != null) lineNumberGutter.repaint();
-
-        if (menuBar != null) applyMenuTheme(menuBar, darkMode);
-        repaint();
+        if (tab.titleLabel != null) tab.titleLabel.setForeground(tabFg);
+        if (tab.closeButton != null) tab.closeButton.setForeground(tabFg);
     }
 
     private void applyMenuTheme(JMenuBar bar, boolean dark) {
@@ -366,6 +447,10 @@ public class Waqompad extends JFrame {
         Color menuFg = dark ? DARK_MENU_FG : UIManager.getColor("MenuBar.foreground");
         bar.setBackground(menuBg);
         bar.setForeground(menuFg);
+        Color lineColor = dark ? new Color(55, 55, 55) : new Color(220, 220, 220);
+        bar.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createMatteBorder(0, 0, 1, 0, lineColor),
+                BorderFactory.createEmptyBorder(2, 4, 2, 4)));
         for (int i = 0; i < bar.getMenuCount(); i++) {
             JMenu menu = bar.getMenu(i);
             if (menu == null) continue;
@@ -390,95 +475,118 @@ public class Waqompad extends JFrame {
         item.setOpaque(true);
     }
 
-    private boolean confirmSaveChanges() {
-        if (!isModified) return true;
-        int choice = JOptionPane.showConfirmDialog(this, "Do you want to save changes?", "WaqomPad", JOptionPane.YES_NO_CANCEL_OPTION);
+    // ---------- File operations ----------
+
+    private boolean confirmSaveChangesForTab(EditorTab tab) {
+        if (!tab.isModified) return true;
+        tabbedPane.setSelectedComponent(tab);
+        int choice = JOptionPane.showConfirmDialog(this, "Do you want to save changes to " + tabLabel(tab).replace("*", "") + "?", "WaqomPad", JOptionPane.YES_NO_CANCEL_OPTION);
         if (choice == JOptionPane.CANCEL_OPTION || choice == JOptionPane.CLOSED_OPTION) return false;
-        return choice != JOptionPane.YES_OPTION || saveFile();
+        return choice != JOptionPane.YES_OPTION || saveTab(tab);
     }
 
-    private void newFile() { if (!confirmSaveChanges()) return; textArea.setText(""); currentFile = null; isModified = false; lastKnownModified = 0L; undoManager.discardAllEdits(); updateTitle(); updateStatusBar(); }
+    private void newTab() { addTab("Untitled"); updateTitle(); updateStatusBar(); updateWordCount(); }
 
     private void openFile() {
-        if (!confirmSaveChanges()) return;
         JFileChooser chooser = new JFileChooser();
         if (chooser.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) {
-            try { loadFileIntoEditor(chooser.getSelectedFile()); }
-            catch (Exception ex) { JOptionPane.showMessageDialog(this, "Could not open file:\n" + ex.getMessage()); }
+            loadFileInTab(chooser.getSelectedFile());
         }
     }
 
-    private void loadFileIntoEditor(File f) throws Exception {
-        String content = Files.readString(f.toPath(), currentEncoding);
-        textArea.setText(content);
-        textArea.setCaretPosition(0);
-        currentFile = f;
-        isModified = false;
-        undoManager.discardAllEdits();
-        lastKnownModified = f.lastModified();
-        updateTitle();
-        updateStatusBar();
-        addRecentFile(f.getAbsolutePath());
+    private void openRecentFile(File f) {
+        if (!f.exists()) { JOptionPane.showMessageDialog(this, "This file no longer exists:\n" + f.getAbsolutePath()); recentFiles.remove(f.getAbsolutePath()); saveRecentFiles(); rebuildRecentMenu(); return; }
+        loadFileInTab(f);
     }
 
-    private boolean saveFile() {
-        if (currentFile == null) return saveAsFile();
+    private void loadFileInTab(File f) {
+        // If already open, just switch to it.
+        for (EditorTab t : allTabs()) {
+            if (t.currentFile != null && t.currentFile.getAbsoluteFile().equals(f.getAbsoluteFile())) {
+                tabbedPane.setSelectedComponent(t);
+                addToRecent(f);
+                return;
+            }
+        }
+        // Reuse a blank, untouched tab if the current one is empty; otherwise open a new tab.
+        EditorTab cur = currentTab();
+        EditorTab target = (cur != null && cur.currentFile == null && !cur.isModified && cur.textArea.getText().isEmpty())
+                ? cur : addTab("Untitled");
         try {
-            Files.writeString(currentFile.toPath(), textArea.getText(), currentEncoding);
-            isModified = false;
-            lastKnownModified = currentFile.lastModified();
-            updateTitle();
-            addRecentFile(currentFile.getAbsolutePath());
-            recoveryFile.delete();
-            return true;
+            target.currentFile = f;
+            target.textArea.setText(Files.readString(f.toPath(), StandardCharsets.UTF_8));
+            target.textArea.setCaretPosition(0);
+            target.isModified = false;
+            target.undoManager.discardAllEdits();
+            tabbedPane.setSelectedComponent(target);
+            updateTabTitle(target);
+            updateStatusBar(); updateWordCount();
+            addToRecent(f);
+        } catch (Exception ex) {
+            JOptionPane.showMessageDialog(this, "Could not open file:\n" + ex.getMessage());
         }
-        catch (Exception ex) { JOptionPane.showMessageDialog(this, "Could not save file:\n" + ex.getMessage()); return false; }
     }
 
-    private boolean saveAsFile() {
+    private boolean saveTab(EditorTab tab) {
+        if (tab.currentFile == null) return saveTabAs(tab);
+        try {
+            Files.writeString(tab.currentFile.toPath(), tab.textArea.getText(), StandardCharsets.UTF_8);
+            tab.isModified = false;
+            updateTabTitle(tab);
+            addToRecent(tab.currentFile);
+            deleteAutosave(tab);
+            return true;
+        } catch (Exception ex) {
+            JOptionPane.showMessageDialog(this, "Could not save file:\n" + ex.getMessage());
+            return false;
+        }
+    }
+
+    private boolean saveTabAs(EditorTab tab) {
         JFileChooser chooser = new JFileChooser();
-        if (currentFile != null) chooser.setSelectedFile(currentFile);
-        if (chooser.showSaveDialog(this) == JFileChooser.APPROVE_OPTION) { currentFile = chooser.getSelectedFile(); return saveFile(); }
+        if (tab.currentFile != null) chooser.setSelectedFile(tab.currentFile);
+        if (chooser.showSaveDialog(this) == JFileChooser.APPROVE_OPTION) {
+            tab.currentFile = chooser.getSelectedFile();
+            return saveTab(tab);
+        }
         return false;
     }
 
-    private void printFile() { try { textArea.print(); } catch (PrinterException ex) { JOptionPane.showMessageDialog(this, "Print failed:\n" + ex.getMessage()); } }
+    private void closeTab(EditorTab tab) {
+        if (!confirmSaveChangesForTab(tab)) return;
+        deleteAutosave(tab);
+        if (tabbedPane.getTabCount() == 1) { exitApp(); return; }
+        tabbedPane.remove(tab);
+    }
+
+    private void printFile() {
+        EditorTab t = currentTab();
+        if (t == null) return;
+        try { t.textArea.print(); } catch (PrinterException ex) { JOptionPane.showMessageDialog(this, "Print failed:\n" + ex.getMessage()); }
+    }
 
     private void exitApp() {
-        if (confirmSaveChanges()) {
-            savePreferencesAndCleanup();
-            dispose();
+        for (EditorTab t : allTabs()) {
+            if (!confirmSaveChangesForTab(t)) return;
         }
+        savePreferences();
+        if (autoSaveTimer != null) autoSaveTimer.stop();
+        for (EditorTab t : allTabs()) deleteAutosave(t);
+        dispose();
     }
 
-    private void savePreferencesAndCleanup() {
-        try {
-            prefs.putBoolean("darkMode", darkMode);
-            prefs.putInt("fontSize", fontSize);
-            prefs.put("fontFamily", textArea.getFont().getFamily());
-            prefs.putBoolean("lineNumbers", lineNumbersEnabled);
-            prefs.put("encoding", currentEncoding.name());
-            Rectangle b = getBounds();
-            prefs.putInt("winX", b.x);
-            prefs.putInt("winY", b.y);
-            prefs.putInt("winW", b.width);
-            prefs.putInt("winH", b.height);
-            prefs.put("recentFiles", String.join("\n", recentFiles));
-        } catch (Exception ignored) {}
-        if (autosaveTimer != null) autosaveTimer.stop();
-        recoveryFile.delete();
-    }
+    // ---------- Recent files ----------
 
-    // ---- Recent files ----
-    private void addRecentFile(String path) {
+    private void addToRecent(File f) {
+        String path = f.getAbsolutePath();
         recentFiles.remove(path);
         recentFiles.add(0, path);
-        while (recentFiles.size() > 8) recentFiles.remove(recentFiles.size() - 1);
+        while (recentFiles.size() > MAX_RECENT) recentFiles.remove(recentFiles.size() - 1);
+        saveRecentFiles();
         rebuildRecentMenu();
     }
 
     private void rebuildRecentMenu() {
-        if (recentMenu == null) return;
         recentMenu.removeAll();
         if (recentFiles.isEmpty()) {
             JMenuItem none = new JMenuItem("No recent files");
@@ -486,190 +594,215 @@ public class Waqompad extends JFrame {
             recentMenu.add(none);
         } else {
             for (String path : recentFiles) {
-                JMenuItem item = new JMenuItem(path);
-                item.addActionListener(e -> openRecentFile(path));
+                File f = new File(path);
+                JMenuItem item = new JMenuItem(f.getName());
+                item.setToolTipText(path);
+                item.addActionListener(e -> openRecentFile(f));
                 recentMenu.add(item);
             }
             recentMenu.addSeparator();
             JMenuItem clear = new JMenuItem("Clear Recent Files");
-            clear.addActionListener(e -> { recentFiles.clear(); rebuildRecentMenu(); });
+            clear.addActionListener(e -> { recentFiles.clear(); saveRecentFiles(); rebuildRecentMenu(); });
             recentMenu.add(clear);
         }
     }
 
-    private void openRecentFile(String path) {
-        if (!confirmSaveChanges()) return;
-        File f = new File(path);
-        if (!f.exists()) {
-            JOptionPane.showMessageDialog(this, "File no longer exists:\n" + path);
-            recentFiles.remove(path);
-            rebuildRecentMenu();
-            return;
-        }
-        try { loadFileIntoEditor(f); }
-        catch (Exception ex) { JOptionPane.showMessageDialog(this, "Could not open file:\n" + ex.getMessage()); }
-    }
+    private void saveRecentFiles() { PREFS.put("recentFiles", String.join("|", recentFiles)); }
 
-    // ---- External modification detection ----
-    private void checkExternalModification() {
-        if (currentFile == null || !currentFile.exists()) return;
-        long modified = currentFile.lastModified();
-        if (modified != lastKnownModified) {
-            int choice = JOptionPane.showConfirmDialog(this,
-                    currentFile.getName() + " was modified outside WaqomPad.\nReload it from disk? (Unsaved changes will be lost.)",
-                    "File Changed", JOptionPane.YES_NO_OPTION);
-            if (choice == JOptionPane.YES_OPTION) {
-                try { loadFileIntoEditor(currentFile); }
-                catch (Exception ex) { JOptionPane.showMessageDialog(this, "Could not reload file:\n" + ex.getMessage()); }
-            } else {
-                lastKnownModified = modified;
-            }
-        }
-    }
+    // ---------- Find / Replace / Go To ----------
 
-    // ---- Autosave / crash recovery ----
-    private void autoSaveRecovery() {
-        if (!isModified) return;
-        try { Files.writeString(recoveryFile.toPath(), textArea.getText(), StandardCharsets.UTF_8); } catch (Exception ignored) {}
+    private void showFindDialog() {
+        EditorTab t = currentTab(); if (t == null) return;
+        String value = JOptionPane.showInputDialog(this, "Find:", t.lastFindText);
+        if (value != null && !value.isEmpty()) { t.lastFindText = value; findText(false); }
     }
-
-    private void checkForRecovery() {
-        try {
-            if (recoveryFile.exists() && recoveryFile.length() > 0) {
-                int choice = JOptionPane.showConfirmDialog(this,
-                        "WaqomPad found unsaved changes from a previous session.\nRecover them now?",
-                        "Recover Unsaved Changes", JOptionPane.YES_NO_OPTION);
-                if (choice == JOptionPane.YES_OPTION) {
-                    textArea.setText(Files.readString(recoveryFile.toPath(), StandardCharsets.UTF_8));
-                    isModified = true;
-                    updateTitle();
-                    updateStatusBar();
-                }
-                recoveryFile.delete();
-            }
-        } catch (Exception ignored) {}
-    }
-
-    private void showFindDialog() { String value = JOptionPane.showInputDialog(this, "Find:", lastFindText); if (value != null && !value.isEmpty()) { lastFindText = value; findText(false); } }
 
     private void findText(boolean previous) {
-        if (lastFindText == null || lastFindText.isEmpty()) { showFindDialog(); return; }
-        String fullText = textArea.getText().toLowerCase();
-        String query = lastFindText.toLowerCase();
-        int caret = textArea.getCaretPosition();
+        EditorTab t = currentTab(); if (t == null) return;
+        if (t.lastFindText == null || t.lastFindText.isEmpty()) { showFindDialog(); return; }
+        String fullText = t.textArea.getText().toLowerCase();
+        String query = t.lastFindText.toLowerCase();
+        int caret = t.textArea.getCaretPosition();
         int index;
         if (previous) { index = fullText.lastIndexOf(query, Math.max(0, caret - query.length() - 1)); if (index < 0) index = fullText.lastIndexOf(query); }
         else { index = fullText.indexOf(query, caret); if (index < 0) index = fullText.indexOf(query); }
-        if (index >= 0) { textArea.requestFocusInWindow(); textArea.select(index, index + lastFindText.length()); }
-        else JOptionPane.showMessageDialog(this, "Cannot find \"" + lastFindText + "\"");
+        if (index >= 0) { t.textArea.requestFocusInWindow(); t.textArea.select(index, index + t.lastFindText.length()); }
+        else JOptionPane.showMessageDialog(this, "Cannot find \"" + t.lastFindText + "\"");
     }
 
     private void showReplaceDialog() {
-        JTextField findField = new JTextField(lastFindText, 20);
+        EditorTab t = currentTab(); if (t == null) return;
+        JTextField findField = new JTextField(t.lastFindText, 20);
         JTextField replaceField = new JTextField(20);
-        JPanel panel = new JPanel(new GridLayout(2, 2, 8, 8));
-        panel.add(new JLabel("Find:")); panel.add(findField); panel.add(new JLabel("Replace with:")); panel.add(replaceField);
-        if (JOptionPane.showConfirmDialog(this, panel, "Replace", JOptionPane.OK_CANCEL_OPTION) == JOptionPane.OK_OPTION) {
-            lastFindText = findField.getText(); if (lastFindText.isEmpty()) return;
-            String selected = textArea.getSelectedText();
-            if (selected != null && selected.equalsIgnoreCase(lastFindText)) textArea.replaceSelection(replaceField.getText());
-            else { findText(false); selected = textArea.getSelectedText(); if (selected != null && selected.equalsIgnoreCase(lastFindText)) textArea.replaceSelection(replaceField.getText()); }
+        JCheckBox regexBox = new JCheckBox("Use regex (applies to Replace All)");
+        JPanel panel = new JPanel();
+        panel.setLayout(new BoxLayout(panel, BoxLayout.Y_AXIS));
+        JPanel row1 = new JPanel(new GridLayout(2, 2, 8, 8));
+        row1.add(new JLabel("Find:")); row1.add(findField);
+        row1.add(new JLabel("Replace with:")); row1.add(replaceField);
+        panel.add(row1);
+        panel.add(Box.createVerticalStrut(8));
+        panel.add(regexBox);
+
+        Object[] options = {"Replace All", "Replace Next", "Cancel"};
+        int choice = JOptionPane.showOptionDialog(this, panel, "Replace", JOptionPane.DEFAULT_OPTION,
+                JOptionPane.PLAIN_MESSAGE, null, options, options[0]);
+
+        String find = findField.getText();
+        String replacement = replaceField.getText();
+        if (find.isEmpty()) return;
+        t.lastFindText = find;
+
+        if (choice == 0) {
+            String text = t.textArea.getText();
+            try {
+                String result = regexBox.isSelected() ? text.replaceAll(find, replacement) : text.replace(find, replacement);
+                t.textArea.setText(result);
+            } catch (PatternSyntaxException ex) {
+                JOptionPane.showMessageDialog(this, "Invalid regular expression:\n" + ex.getMessage());
+            }
+        } else if (choice == 1) {
+            if (regexBox.isSelected()) {
+                JOptionPane.showMessageDialog(this, "Regex is only supported with Replace All.");
+                return;
+            }
+            String selected = t.textArea.getSelectedText();
+            if (selected != null && selected.equalsIgnoreCase(t.lastFindText)) t.textArea.replaceSelection(replacement);
+            else { findText(false); selected = t.textArea.getSelectedText(); if (selected != null && selected.equalsIgnoreCase(t.lastFindText)) t.textArea.replaceSelection(replacement); }
         }
     }
 
     private void goToLine() {
+        EditorTab t = currentTab(); if (t == null) return;
         String input = JOptionPane.showInputDialog(this, "Line number:"); if (input == null) return;
-        try { int line = Integer.parseInt(input.trim()); int max = textArea.getLineCount();
+        try {
+            int line = Integer.parseInt(input.trim()); int max = t.textArea.getLineCount();
             if (line < 1 || line > max) { JOptionPane.showMessageDialog(this, "Line number must be between 1 and " + max + "."); return; }
-            textArea.setCaretPosition(textArea.getLineStartOffset(line - 1)); textArea.requestFocusInWindow();
+            t.textArea.setCaretPosition(t.textArea.getLineStartOffset(line - 1)); t.textArea.requestFocusInWindow();
         } catch (Exception ex) { JOptionPane.showMessageDialog(this, "Invalid line number."); }
     }
 
-    private void insertTimeDate() { textArea.replaceSelection(new SimpleDateFormat("hh:mm a dd/MM/yyyy").format(new Date())); }
+    private void insertTimeDate() {
+        EditorTab t = currentTab(); if (t == null) return;
+        t.textArea.replaceSelection(new SimpleDateFormat("hh:mm a dd/MM/yyyy").format(new Date()));
+    }
 
-    // ---- Case conversion ----
-    private void convertCase(int mode) {
-        String sel = textArea.getSelectedText();
-        if (sel == null || sel.isEmpty()) { JOptionPane.showMessageDialog(this, "Select some text first."); return; }
-        String result;
+    // ---------- Case conversion ----------
+
+    private void convertSelectionCase(int mode) {
+        EditorTab t = currentTab(); if (t == null) return;
+        String selected = t.textArea.getSelectedText();
+        if (selected == null || selected.isEmpty()) { JOptionPane.showMessageDialog(this, "Select some text first."); return; }
+        String converted;
         switch (mode) {
-            case 0: result = sel.toUpperCase(); break;
-            case 1: result = sel.toLowerCase(); break;
-            default: result = toTitleCase(sel);
+            case 0 -> converted = selected.toUpperCase();
+            case 1 -> converted = selected.toLowerCase();
+            default -> converted = toTitleCase(selected);
         }
-        textArea.replaceSelection(result);
+        t.textArea.replaceSelection(converted);
     }
 
     private String toTitleCase(String s) {
         StringBuilder sb = new StringBuilder();
-        boolean newWord = true;
+        boolean capitalizeNext = true;
         for (char c : s.toCharArray()) {
-            if (Character.isWhitespace(c)) { newWord = true; sb.append(c); }
-            else { sb.append(newWord ? Character.toUpperCase(c) : Character.toLowerCase(c)); newWord = false; }
+            if (Character.isWhitespace(c)) { capitalizeNext = true; sb.append(c); }
+            else if (capitalizeNext) { sb.append(Character.toUpperCase(c)); capitalizeNext = false; }
+            else sb.append(Character.toLowerCase(c));
         }
         return sb.toString();
     }
 
-    // ---- Line operations ----
-    private void sortLines() {
-        String[] lines = textArea.getText().split("\n", -1);
-        List<String> list = new ArrayList<>(Arrays.asList(lines));
-        Collections.sort(list);
-        textArea.setText(String.join("\n", list));
-    }
+    // ---------- Line operations ----------
 
     private void duplicateLine() {
+        EditorTab t = currentTab(); if (t == null) return;
         try {
-            int pos = textArea.getCaretPosition();
-            int line = textArea.getLineOfOffset(pos);
-            int start = textArea.getLineStartOffset(line);
-            int end = textArea.getLineEndOffset(line);
-            String lineText = textArea.getText(start, end - start);
-            textArea.insert(lineText, end);
-        } catch (BadLocationException ignored) {}
+            int caret = t.textArea.getCaretPosition();
+            int line = t.textArea.getLineOfOffset(caret);
+            int start = t.textArea.getLineStartOffset(line);
+            int end = t.textArea.getLineEndOffset(line);
+            String lineText = t.textArea.getText(start, end - start);
+            t.textArea.insert(lineText, end);
+            t.textArea.setCaretPosition(Math.min(end + lineText.length(), t.textArea.getDocument().getLength()));
+        } catch (Exception ignored) {}
     }
 
-    private void moveLine(boolean up) {
+    private void moveLineUp() {
+        EditorTab t = currentTab(); if (t == null) return;
         try {
-            String[] lines = textArea.getText().split("\n", -1);
-            int pos = textArea.getCaretPosition();
-            int line = textArea.getLineOfOffset(pos);
-            int col = pos - textArea.getLineStartOffset(line);
-            int target = up ? line - 1 : line + 1;
-            if (target < 0 || target >= lines.length) return;
-            String tmp = lines[line]; lines[line] = lines[target]; lines[target] = tmp;
-            textArea.setText(String.join("\n", lines));
-            int newPos = textArea.getLineStartOffset(target) + Math.min(col, lines[target].length());
-            textArea.setCaretPosition(newPos);
-        } catch (BadLocationException ignored) {}
+            int caret = t.textArea.getCaretPosition();
+            int line = t.textArea.getLineOfOffset(caret);
+            if (line == 0) return;
+            int prevStart = t.textArea.getLineStartOffset(line - 1);
+            int prevEnd = t.textArea.getLineEndOffset(line - 1);
+            int curStart = t.textArea.getLineStartOffset(line);
+            int curEnd = t.textArea.getLineEndOffset(line);
+            String prevText = t.textArea.getText(prevStart, prevEnd - prevStart);
+            String curText = t.textArea.getText(curStart, curEnd - curStart);
+            int offsetInLine = caret - curStart;
+            t.textArea.replaceRange(curText + prevText, prevStart, curEnd);
+            t.textArea.setCaretPosition(prevStart + curText.length() + offsetInLine);
+        } catch (Exception ignored) {}
     }
+
+    private void moveLineDown() {
+        EditorTab t = currentTab(); if (t == null) return;
+        try {
+            int caret = t.textArea.getCaretPosition();
+            int line = t.textArea.getLineOfOffset(caret);
+            int lastLine = t.textArea.getLineCount() - 1;
+            if (line >= lastLine) return;
+            int curStart = t.textArea.getLineStartOffset(line);
+            int curEnd = t.textArea.getLineEndOffset(line);
+            int nextStart = t.textArea.getLineStartOffset(line + 1);
+            int nextEnd = t.textArea.getLineEndOffset(line + 1);
+            String curText = t.textArea.getText(curStart, curEnd - curStart);
+            String nextText = t.textArea.getText(nextStart, nextEnd - nextStart);
+            int offsetInLine = caret - curStart;
+            t.textArea.replaceRange(nextText + curText, curStart, nextEnd);
+            t.textArea.setCaretPosition(curStart + nextText.length() + offsetInLine);
+        } catch (Exception ignored) {}
+    }
+
+    // ---------- Font / zoom ----------
 
     private void chooseFont() {
+        EditorTab cur = currentTab();
+        Font base = cur != null ? cur.textArea.getFont() : new Font(Font.MONOSPACED, Font.PLAIN, fontSize);
         String[] fonts = GraphicsEnvironment.getLocalGraphicsEnvironment().getAvailableFontFamilyNames();
-        JComboBox<String> fontBox = new JComboBox<>(fonts); fontBox.setSelectedItem(textArea.getFont().getFamily());
-        JSpinner sizeSpinner = new JSpinner(new SpinnerNumberModel(textArea.getFont().getSize(), 8, 72, 1));
+        JComboBox<String> fontBox = new JComboBox<>(fonts); fontBox.setSelectedItem(base.getFamily());
+        JSpinner sizeSpinner = new JSpinner(new SpinnerNumberModel(base.getSize(), 8, 72, 1));
         JPanel panel = new JPanel(new GridLayout(2, 2, 8, 8));
         panel.add(new JLabel("Font:")); panel.add(fontBox); panel.add(new JLabel("Size:")); panel.add(sizeSpinner);
         if (JOptionPane.showConfirmDialog(this, panel, "Font", JOptionPane.OK_CANCEL_OPTION) == JOptionPane.OK_OPTION) {
             Font newFont = new Font((String) fontBox.getSelectedItem(), Font.PLAIN, (int) sizeSpinner.getValue());
-            textArea.setFont(newFont); fontSize = newFont.getSize();
-            lineNumberGutter.setFont(newFont); lineNumberGutter.revalidate(); lineNumberGutter.repaint();
+            fontSize = newFont.getSize();
+            for (EditorTab t : allTabs()) {
+                t.textArea.setFont(newFont);
+                t.lineNumberArea.setFont(newFont);
+                t.lineNumberArea.updateWidth();
+            }
         }
     }
 
     private void setEditorFontSize(int size) {
         if (size < 8 || size > 72) return;
         fontSize = size;
-        Font current = textArea.getFont();
-        Font newFont = new Font(current.getFamily(), current.getStyle(), fontSize);
-        textArea.setFont(newFont);
-        lineNumberGutter.setFont(newFont);
-        lineNumberGutter.revalidate();
-        lineNumberGutter.repaint();
+        for (EditorTab t : allTabs()) {
+            Font current = t.textArea.getFont();
+            Font newFont = new Font(current.getFamily(), current.getStyle(), fontSize);
+            t.textArea.setFont(newFont);
+            t.lineNumberArea.setFont(newFont);
+            t.lineNumberArea.updateWidth();
+        }
     }
 
+    // ---------- Misc ----------
+
     private void searchWithBing() {
-        String query = textArea.getSelectedText();
+        EditorTab t = currentTab(); if (t == null) return;
+        String query = t.textArea.getSelectedText();
         if (query == null || query.isBlank()) query = JOptionPane.showInputDialog(this, "Search with Bing:");
         if (query == null || query.isBlank()) return;
         try { Desktop.getDesktop().browse(new URI("https://www.bing.com/search?q=" + URLEncoder.encode(query, StandardCharsets.UTF_8))); }
@@ -694,45 +827,177 @@ public class Waqompad extends JFrame {
         g.dispose(); return image;
     }
 
-    /** Row-header gutter that paints line numbers next to the text area. */
-    private class LineNumberGutter extends JComponent {
-        LineNumberGutter() { setFont(textArea.getFont()); }
+    // ---------- Preferences ----------
 
-        @Override
-        public Dimension getPreferredSize() {
-            FontMetrics fm = getFontMetrics(textArea.getFont());
-            int digits = Math.max(2, String.valueOf(Math.max(1, textArea.getLineCount())).length());
-            int width = fm.stringWidth("0") * digits + 16;
-            return new Dimension(width, textArea.getHeight());
+    private void loadPreferences() {
+        fontSize = PREFS.getInt("fontSize", 18);
+        darkMode = PREFS.getBoolean("darkMode", false);
+        String stored = PREFS.get("recentFiles", "");
+        recentFiles.clear();
+        if (!stored.isEmpty()) {
+            for (String p : stored.split("\\|")) if (!p.isBlank()) recentFiles.add(p);
+        }
+    }
+
+    private void applySavedWindowBounds() {
+        int w = PREFS.getInt("winW", -1);
+        int h = PREFS.getInt("winH", -1);
+        int x = PREFS.getInt("winX", -1);
+        int y = PREFS.getInt("winY", -1);
+        if (w > 100 && h > 100 && x >= 0 && y >= 0) {
+            setBounds(x, y, w, h);
+        } else {
+            setLocationRelativeTo(null);
+        }
+    }
+
+    private void savePreferences() {
+        PREFS.putInt("fontSize", fontSize);
+        PREFS.putBoolean("darkMode", darkMode);
+        PREFS.putBoolean("wordWrap", wordWrapItem.isSelected());
+        PREFS.putBoolean("lineNumbers", lineNumbersItem.isSelected());
+        PREFS.putBoolean("alwaysOnTop", alwaysOnTopItem.isSelected());
+        Rectangle b = getBounds();
+        PREFS.putInt("winX", b.x);
+        PREFS.putInt("winY", b.y);
+        PREFS.putInt("winW", b.width);
+        PREFS.putInt("winH", b.height);
+        saveRecentFiles();
+    }
+
+    // ---------- Autosave / crash recovery ----------
+
+    private void setupAutoSave() {
+        autoSaveTimer = new javax.swing.Timer(30_000, e -> performAutoSave());
+        autoSaveTimer.setRepeats(true);
+        autoSaveTimer.start();
+    }
+
+    private File autosaveFile(EditorTab tab) { return new File(AUTOSAVE_DIR, tab.autosaveId + ".tmp"); }
+
+    private void deleteAutosave(EditorTab tab) {
+        File f = autosaveFile(tab);
+        if (f.exists()) f.delete();
+    }
+
+    private void performAutoSave() {
+        for (EditorTab t : allTabs()) {
+            File f = autosaveFile(t);
+            if (t.isModified) {
+                try {
+                    String marker = t.currentFile == null ? "UNTITLED" : t.currentFile.getAbsolutePath();
+                    Files.writeString(f.toPath(), marker + "\n" + t.textArea.getText(), StandardCharsets.UTF_8);
+                } catch (IOException ignored) {}
+            } else if (f.exists()) {
+                f.delete();
+            }
+        }
+    }
+
+    private void checkForRecovery() {
+        File[] files = AUTOSAVE_DIR.listFiles((dir, name) -> name.endsWith(".tmp"));
+        if (files == null || files.length == 0) return;
+        int choice = JOptionPane.showConfirmDialog(this,
+                "WaqomPad found " + files.length + " unsaved tab(s) from a previous session. Recover them?",
+                "Recover unsaved changes", JOptionPane.YES_NO_OPTION);
+        if (choice == JOptionPane.YES_OPTION) {
+            boolean firstUsed = false;
+            for (File f : files) {
+                try {
+                    String content = Files.readString(f.toPath(), StandardCharsets.UTF_8);
+                    int newline = content.indexOf('\n');
+                    if (newline < 0) { f.delete(); continue; }
+                    String marker = content.substring(0, newline);
+                    String body = content.substring(newline + 1);
+
+                    EditorTab target;
+                    if (!firstUsed) {
+                        target = currentTab();
+                        firstUsed = true;
+                    } else {
+                        target = addTab("Untitled");
+                    }
+                    target.textArea.setText(body);
+                    if (!"UNTITLED".equals(marker)) {
+                        File orig = new File(marker);
+                        if (orig.exists()) target.currentFile = orig;
+                    }
+                    target.isModified = true;
+                    target.undoManager.discardAllEdits();
+                    updateTabTitle(target);
+                } catch (IOException ignored) {}
+                f.delete();
+            }
+            updateStatusBar(); updateWordCount();
+        } else {
+            for (File f : files) f.delete();
+        }
+    }
+
+    // ---------- Editor tab ----------
+
+    private static class EditorTab extends JPanel {
+        final JTextArea textArea = new JTextArea();
+        final UndoManager undoManager = new UndoManager();
+        final JScrollPane scrollPane;
+        final LineNumberArea lineNumberArea;
+        final String autosaveId = UUID.randomUUID().toString();
+        File currentFile = null;
+        boolean isModified = false;
+        String lastFindText = "";
+        JLabel titleLabel;
+        JPanel tabComponent;
+        JButton closeButton;
+
+        EditorTab() {
+            super(new BorderLayout());
+            lineNumberArea = new LineNumberArea(textArea);
+            scrollPane = new JScrollPane(textArea);
+            scrollPane.setBorder(BorderFactory.createEmptyBorder());
+            add(scrollPane, BorderLayout.CENTER);
+        }
+    }
+
+    // ---------- Line number gutter ----------
+
+    private static class LineNumberArea extends JComponent {
+        private final JTextArea textArea;
+
+        LineNumberArea(JTextArea textArea) {
+            this.textArea = textArea;
+            setFont(textArea.getFont());
+            setOpaque(true);
+            updateWidth();
+        }
+
+        void updateWidth() {
+            FontMetrics fm = getFontMetrics(getFont());
+            int lines = Math.max(1, textArea.getLineCount());
+            int digits = Math.max(2, String.valueOf(lines).length());
+            int width = fm.charWidth('0') * digits + 16;
+            setPreferredSize(new Dimension(width, textArea.getHeight()));
+            revalidate();
+            repaint();
         }
 
         @Override
         protected void paintComponent(Graphics g) {
-            super.paintComponent(g);
-            Color bg = darkMode ? DARK_STATUSBAR_BG : LIGHT_STATUSBAR_BG;
-            Color fg = darkMode ? new Color(150, 150, 150) : new Color(120, 120, 120);
-            g.setColor(bg);
+            g.setColor(getBackground());
             g.fillRect(0, 0, getWidth(), getHeight());
-            g.setColor(fg);
-            g.setFont(textArea.getFont());
-            FontMetrics fm = g.getFontMetrics();
+            FontMetrics fm = g.getFontMetrics(getFont());
+            int lineHeight = fm.getHeight();
             Rectangle clip = g.getClipBounds();
-            try {
-                int startOffset = textArea.viewToModel2D(new Point(0, Math.max(0, clip.y)));
-                int endOffset = textArea.viewToModel2D(new Point(0, clip.y + clip.height));
-                while (startOffset <= endOffset) {
-                    int lineNumber = textArea.getLineOfOffset(startOffset);
-                    Rectangle2D r = textArea.modelToView2D(startOffset);
-                    if (r == null) break;
-                    int y = (int) r.getY() + fm.getAscent();
-                    String text = String.valueOf(lineNumber + 1);
-                    int x = getWidth() - fm.stringWidth(text) - 8;
-                    g.drawString(text, x, y);
-                    int nextOffset = Utilities.getRowEnd(textArea, startOffset) + 1;
-                    if (nextOffset <= startOffset) break;
-                    startOffset = nextOffset;
-                }
-            } catch (BadLocationException ignored) {}
+            int startLine = Math.max(0, clip.y / lineHeight);
+            int endLine = (clip.y + clip.height) / lineHeight + 1;
+            int total = textArea.getLineCount();
+            g.setColor(getForeground());
+            g.setFont(getFont());
+            for (int line = startLine; line <= endLine && line < total; line++) {
+                int y = (line + 1) * lineHeight - fm.getDescent();
+                String num = String.valueOf(line + 1);
+                int x = getWidth() - fm.stringWidth(num) - 6;
+                g.drawString(num, x, y);
+            }
         }
     }
 }
